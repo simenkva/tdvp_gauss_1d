@@ -5,6 +5,8 @@ from fft_tdse.fouriergrid import fftgrid
 from scipy.linalg import cho_factor, cho_solve
 from scipy.linalg import expm
 import matplotlib.pyplot as plt
+from itertools import product
+from time import time
 
 # set display to pretty printing if not in a notebook
 try:
@@ -171,12 +173,6 @@ class Gauss1D:
         self.J211_sym = self.mydiff(self.J210_sym, X2)
         self.J310_sym = self.mydiff(self.J300_sym, X1)
         self.J400_sym = self.mydiff(self.J300_sym, X0)
-
-        # self.J030_sym = self.mydiff(self.J020_sym, X1)
-        # self.J120_sym = self.mydiff(self.J110_sym, X1)
-        # self.J021_sym = self.mydiff(self.J020_sym, X2)
-        # self.J201_sym = self.mydiff(self.J200_sym, X2)
-        # self.J102_sym = self.mydiff(self.J101_sym, X2)
 
         # expoential function is common for all integrals -
         # factor it.
@@ -948,7 +944,8 @@ class LCGauss1D:
         G = np.einsum("mipj,i,j->mipj", G, self.c.conj(), self.c)
         self.G = G
 
-        return S
+        A0 = G - np.einsum("mik,kl,njl->minj", F, self.S_inv, F.conj())
+        self.A = A0.real.reshape((self.n_par * n, self.n_par * n))
 
     def hamiltonian_matrix(self):
         """Compute Hamiltonian matrix."""
@@ -1147,6 +1144,7 @@ class LCGauss1D:
         self.overlap_matrices()
         self.hamiltonian_matrix()
 
+        A = self.A
         F = self.F
         G = self.G
 
@@ -1154,9 +1152,9 @@ class LCGauss1D:
         n_par = self.n_par
         X = self.X
 
-        A0 = G - np.einsum("mik,kl,njl->minj", F, self.S_inv, F.conj())
-        A = A0.real.reshape((n_par * n, n_par * n))
-        self.A = A
+        # A0 = G - np.einsum("mik,kl,njl->minj", F, self.S_inv, F.conj())
+        # A = A0.real.reshape((n_par * n, n_par * n))
+        # self.A = A
 
         # compute the Q-space vector field
         # b = Im[<partial m i|H|j>c_j - <partial m i|>S_inv(i,l)<l|H|j> c_j]
@@ -1415,6 +1413,260 @@ class LCGauss1D:
         return cho_solve(self.S_chol, g)
 
 
+    def curvature_tensor(self):
+        """ Compute the curvature tensor K (not really the curvature tensor ... ) """
+
+        N = self.n
+        n_par = self.n_par
+        N2 = N * n_par
+        dim = 2*N + N2 # dimension of tangent space
+        
+        X = self.X
+        Y = self.Y
+
+        # 
+        # Compute gaussian derivative tensors
+        #
+        D1 = np.zeros((3, N, N), dtype=complex)
+        D2 = np.zeros((3, 3, N, N), dtype=complex)
+        D3 = np.zeros((3, 3, 3, N, N), dtype=complex)
+        D4 = np.zeros((3, 3, 3, 3, N, N), dtype=complex)
+        
+        for u in range(3):
+            D1[u, :, :] = self.g.D1(u)(Y)
+            for v in range(3):
+                D2[u, v, :, :] = self.g.D2(u, v)(Y)
+                for w in range(3):
+                    D3[u, v, w, :, :] = self.g.D3(u, v, w)(Y)
+                    for q in range(3):
+                        D4[u, v, w, q, :, :] = self.g.D4(u, v, w, q)(Y)
+        
+        #              
+        #
+        # Compute the U matrix and oter matrices needed
+        # U, W, X, tilde_S_inv, A_inv
+        #
+        # We recall the index format for M:
+        #  self.M = np.zeros((3, self.n_par, self.n), dtype=complex)
+        M = self.M
+        c = self.c
+        U = np.einsum("i,uni,uki->kni", c, M, D1).reshape((N, N2))
+        
+        REIM = lambda x: np.concatenate((x.real, x.imag), axis=0)
+        REIM2 = lambda A: np.block([[A.real, -A.imag], [A.imag, A.real]])
+
+        U = REIM(U)
+        
+        tilde_S_inv = REIM2(self.S_inv)
+        
+        A_inv = np.linalg.inv(self.A) # may need regularization.
+        #ic(tilde_S_inv.shape, U.shape, A_inv.shape)
+        W = tilde_S_inv @ U @ A_inv
+        X = W @ U.T @ tilde_S_inv
+        
+        #
+        # Compute the K0, K1, K2 tensors.
+        #
+        K0 = np.zeros((dim,dim,dim,dim))
+        K1 = np.zeros((N, dim, dim), dtype=complex)
+        K2 = np.zeros((N2, dim, dim))
+
+        # index of P-space variables
+        P_ind = lambda i, s: i + s*N
+        # index of Q-space variables
+#        Q_ind = lambda i, n: n + n_par*i + 2*N
+
+        Q_ind = lambda i, n: i + N*n + 2*N
+        
+        # z_test = np.zeros((n_par, N))
+        # for m in range(n_par):
+        #     for i in range(N):
+        #         z_test[m, i] = m + 10*i
+
+        # z_test2 = np.zeros(N2)
+        # for i in range(N):
+        #     for m in range(n_par):
+        #         z_test2[Q_ind(i,m)-2*N] = m + 10*i
+                
+        # ic(z_test.flatten()-z_test2)
+        
+        # K1_c_z 
+        for k in range(N):
+            for i,s,m in product(range(N), range(2), range(n_par)):
+                j = i
+                element = (1j)**s * np.sum(M[:, m, i] * D1[:, k, i])
+                K1[k, P_ind(i, s), Q_ind(i, m)] = element
+                K1[k, Q_ind(i, m), P_ind(i, s)] = element
+
+        
+        # K1_z_z
+        for k in range(N):
+            for (i, m) in product(range(N), range(n_par)):
+                j = i
+                for n in range(n_par):
+                    element =  c[i] * np.einsum('u,v,uv->', M[:,m,i], M[:,n,i], D2[:,:,k,i])
+                    K1[k, Q_ind(i, m), Q_ind(i, n)] = element
+                    #K1[k, Q_ind(i, n), Q_ind(i, m)] = element
+        
+         
+        K1 = REIM(K1)               
+            
+
+            
+        # K2_c_z
+        temp = D2 - np.einsum('wkl,lm,umi->wuki', D1, self.S_inv, D1)
+        for (k, o) in product(range(N), range(n_par)):
+            for (i, s) in product(range(N), range(2)):
+                    for m in range(n_par):
+                        element = (1j)**s * c[k].conj() * np.einsum('w,u,wu->', M[:,o,k].conj(), M[:,m,i], temp[:,:,k,i])
+                        K2[Q_ind(k, o) - 2*N, P_ind(i, s), Q_ind(i, m)] = element.real
+                        K2[Q_ind(k, o) - 2*N, Q_ind(i, m), P_ind(i, s)] = element.real
+        
+        # K2_z_z[ko, in, jm] --> [o, k, n, i, m, j] to be consistent with ordering of z.
+        temp = D3 - np.einsum('wkl,lm,uvmi->wuvki', D1, self.S_inv, D2, optimize=True)
+        for (k, o) in product(range(N), range(n_par)):
+                for (i, m) in product(range(N), range(n_par)):
+                    for n in range(n_par):
+                        element = c[i] * c[k].conj() * np.einsum('w,u,v,wuv->', M[:,o,k].conj(), M[:,n,i], M[:,m,i], temp[:,:,:,k,i])        
+                        
+                        K2[Q_ind(k, o) - 2*N, Q_ind(i,n), Q_ind(i,m)] = element.real
+                        #K2[Q_ind(k, o) - 2*N, Q_ind(i,m), Q_ind(i,n)] = element.real
+                        
+
+
+        # K0_c_z_c_Z
+        for (i, s) in product(range(N), range(2)):
+                j = i
+                for m in range(n_par):
+                    for (i2, s2) in product(range(N), range(2)):
+                        for m2 in range(n_par):
+                            element = (1j)**(-s) * np.einsum('u,v,uv->', M[:,m,i].conj(), M[:,m2,i2], D2[:, :, i, i2])
+                            K0[P_ind(i, s), Q_ind(i, m), P_ind(i2, s2), Q_ind(i2, m2)] = element.real
+                            K0[P_ind(i, s), Q_ind(i, m), Q_ind(i2, m2), P_ind(i2, s2)] = element.real
+                            K0[Q_ind(i, m), P_ind(i, s), P_ind(i2, s2), Q_ind(i2, m2)] = element.real
+                            K0[Q_ind(i, m), P_ind(i, s), Q_ind(i2, m2), P_ind(i2, s2)] = element.real
+            
+        # K0_c_z_z_z 
+        for (i, s) in product(range(N), range(2)):
+            for m in range(n_par):
+                for (i2, n2) in product(range(N), range(n_par)):
+                        for m2 in range(n_par):
+                            element = (1j)**(-s) * c[i].conj() * np.einsum('u,v,w,uvw->', M[:,m,i].conj(), M[:,n2,i2], M[:,m2,i2], D3[:,:, :, i, i2])
+                            K0[P_ind(i, s), Q_ind(i, m), Q_ind(i2, n2), Q_ind(i2, m2)] = element.real
+                            K0[Q_ind(i, m), P_ind(i, s), Q_ind(i2, n2), Q_ind(i2, m2)] = element.real
+                            K0[Q_ind(i2, n2), Q_ind(i2, m2), P_ind(i, s), Q_ind(i, m)] = element.real
+                            K0[Q_ind(i2, n2), Q_ind(i2, m2), Q_ind(i, m), P_ind(i, s)] = element.real
+                            
+
+
+        # K0_z_z_z_z 
+        for (i, n, m) in product(range(N), range(n_par), range(n_par)):
+            for (i2, n2, m2) in product(range(N), range(n_par), range(n_par)):
+                element = c[i].conj() * c[i2] * np.einsum('u,v,w,q,uvwq->', M[:,n,i].conj(), M[:,m,i].conj(), M[:,n2,i2], M[:,m2,i2], D4[:,:,:,:,i,i2])
+                K0[Q_ind(i, n), Q_ind(i, m), Q_ind(i2, n2), Q_ind(i2, m2)] = element.real
+
+
+        
+
+        #
+        # We have all the blocks -- assemble the curvature tensor
+        #
+        
+        Ka = np.einsum('jKL,jk,kMN->KLMN', K1, tilde_S_inv + X, K1, optimize=True)
+        Kb = np.einsum('jKL,jz,zMN->KLMN', K1, W, K2, optimize=True)
+        Kc = np.einsum('KLMN->MNKL', Kb, optimize=True)
+        #Kc = np.einsum('jKL,jz,zMN->MNKL', K1, W, K2, optimize=True)
+        Kd = np.einsum('zKL,zw,wMN->KLMN', K2, A_inv, K2, optimize=True)
+        K = K0 - Ka + Kb + Kc - Kd
+
+        # # Check symmetry of K
+        # ic(np.linalg.norm(K1 - np.swapaxes(K1, 1,2)))
+        # ic(np.linalg.norm(K2 - np.swapaxes(K2, 1,2)))
+                
+        # ic(np.linalg.norm(K0 - np.swapaxes(K0, 0,1)))
+        # ic(np.linalg.norm(K0 - np.swapaxes(K0, 2,3)))
+        # ic(np.linalg.norm(K0 - np.swapaxes(np.swapaxes(K0, 0,1), 2,3)))
+
+        # ic(np.linalg.norm(Ka - np.swapaxes(Ka, 0,1)))
+        # ic(np.linalg.norm(Ka - np.swapaxes(Ka, 2,3)))
+        # ic(np.linalg.norm(Ka - np.swapaxes(np.swapaxes(Ka, 0,1), 2,3)))
+
+        # ic(np.linalg.norm(Kb - np.swapaxes(Kb, 0,1)))
+        # ic(np.linalg.norm(Kb - np.swapaxes(Kb, 2,3)))
+        # ic(np.linalg.norm(Kb - np.swapaxes(np.swapaxes(Kb, 0,1), 2,3)))
+
+        # ic(np.linalg.norm(Kc - np.swapaxes(Kc, 0,1)))
+        # ic(np.linalg.norm(Kc - np.swapaxes(Kc, 2,3)))
+        # ic(np.linalg.norm(Kc - np.swapaxes(np.swapaxes(Kc, 0,1), 2,3)))
+
+        # ic(np.linalg.norm(Kd - np.swapaxes(Kd, 0,1)))
+        # ic(np.linalg.norm(Kd - np.swapaxes(Kd, 2,3)))
+        # ic(np.linalg.norm(Kd - np.swapaxes(np.swapaxes(Kd, 0,1), 2,3)))
+
+        # ic(np.linalg.norm(K - np.swapaxes(K, 0,1)))
+        # ic(np.linalg.norm(K - np.swapaxes(K, 2,3)))
+        # ic(np.linalg.norm(K - np.swapaxes(np.swapaxes(K, 0,1), 2,3)))
+        
+        
+        #
+        # Save the K tensor.
+        #
+        self.K = K
+        
+        
+        #
+        # Compute orthonoral basis of the tangent space
+        #
+        # First, compute the metric.
+        tilde_S = REIM2(self.S) 
+        g = np.block([[tilde_S, np.zeros((2*N, N2))], [np.zeros((N2, 2*N)), np.zeros((N2,N2))]])
+        
+        for (i, s) in product(range(N), range(2)):
+            for (j, m) in product(range(N), range(n_par)):
+                element = (1j)**(-s) * c[j] * np.einsum('u,u->', M[:,m,j], D1[:,i,j])
+                g[P_ind(i, s), Q_ind(j, m)] = element.real
+                g[Q_ind(j, m), P_ind(i, s)] = element.real
+                
+        for (i, m) in product(range(N), range(n_par)):
+            for (j, n) in product(range(N), range(n_par)):
+                element = c[i].conj() * c[j] * np.einsum('u,v,uv->', M[:,m,i].conj(), M[:,n,j], D2[:,:,i,j])
+                g[Q_ind(i, m), Q_ind(j, n)] = element.real
+
+        self.metric = g
+
+        ic(np.linalg.norm(g - g.T))
+            
+        # Diagonalize metric and use symmetric orthogonalization
+        # to compute an ONB for tangent space.
+        
+        Ell, U = np.linalg.eigh(g)
+        Z = U @ np.diag(np.sqrt(1/Ell)) @ U.T
+        
+        delta = np.linalg.norm(Z.T @ g @ Z - np.eye(dim))
+        if delta > 1e-10:
+            ic('Warning: Z is not orthogonal')
+        
+        #Z, R = np.linalg.qr(V)
+        #ic(np.round(Z,2))
+        #
+        # Compute scalar curvature measure
+        #
+        self.kappa = np.einsum('Ki,Li,KMLN,Mj,Nj->', Z, Z, K, Z, Z)
+        self.kappa0 = np.einsum('Ki,Li,KMLN,Mj,Nj->', Z, Z, K0, Z, Z)
+        #ic(self.kappa)
+        
+        self.diag0 = np.zeros((dim, dim))
+        self.diaga = np.zeros((dim, dim))
+        self.diagbc = np.zeros((dim, dim))
+        self.diagd = np.zeros((dim, dim))
+        for k in range(dim):
+            for l in range(dim):
+                self.diag0[k,l] = K0[k,l,k,l]
+                self.diaga[k,l] = Ka[k,l,k,l]
+                self.diagbc[k,l] = -Kb[k,l,k,l] + -Kc[k,l,k,l]
+                self.diagd[k,l] = Kd[k,l,k,l]
+            
+
 def test1():
     #
     # Do a test of the speeup of vectorization.
@@ -1479,6 +1731,11 @@ def test1():
     ic(time_derivative_vectorized / time_derivative_vectorized_factorized)
     ic(time_derivative_non_vectorized / time_derivative_vectorized_factorized)
     ic(np.allclose(J, J2))
+
+
+
+
+
 
 
 def test2():
